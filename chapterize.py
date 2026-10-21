@@ -335,31 +335,41 @@ def plan_scenes(a, b, silences, gap, min_scene, guard=8.0):
 
 # ---------------------------------------------------------------------------- cut
 def cut(parts, a, b, out, meta, tmp):
-    """Cut global-time range [a, b) to `out`, stitching across audio files if needed."""
+    """Cut global-time range [a, b) to `out`, stitching across audio files if needed,
+    inheriting original metadata, and fixing container durations for audiobook players."""
     pieces = []
     for idx, (path, off, dur) in enumerate(parts):
         s, e = max(a, off), min(b, off + dur)
         if e - s > 0.05:
             pieces.append((path, s - off, e - off, idx))
     out.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Grab the primary source file to inherit full original metadata (author, cover art, etc.)
+    primary_path = pieces[0][0] if pieces else parts[0][0]
+
     mdargs = []
     for k, v in meta.items():
         mdargs += ["-metadata", f"{k}={v}"]
+
     tmp.mkdir(parents=True, exist_ok=True)
     tmpfiles = []
     for n, (path, s, e, idx) in enumerate(pieces):
         t = tmp / f"piece{n}.m4a"
+        # Using -avoid_negative_ts make_zero ensures timestamps start cleanly at zero for each slice
         run(["ffmpeg", "-v", "error", "-y", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", str(path),
-             "-map", "0:a:0", "-c", "copy", str(t)])
+             "-map", "0:a:0", "-c", "copy", "-avoid_negative_ts", "make_zero", str(t)])
         tmpfiles.append(t)
+
     if len(tmpfiles) == 1:
-        run(["ffmpeg", "-v", "error", "-y", "-i", str(tmpfiles[0]), "-map", "0:a", "-c", "copy",
+        run(["ffmpeg", "-v", "error", "-y", "-i", str(tmpfiles[0]), 
+             "-i", str(primary_path), "-map_metadata", "1", "-map", "0:a", "-c", "copy",
              *mdargs, "-movflags", "+faststart", str(out)])
     else:
         lst = tmp / "list.txt"
         lst.write_text("".join(f"file '{t.as_posix()}'\n" for t in tmpfiles), encoding="utf8")
         run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-             "-c", "copy", *mdargs, "-movflags", "+faststart", str(out)])
+             "-i", str(primary_path), "-map_metadata", "1", "-map", "0:a", "-c", "copy",
+             *mdargs, "-movflags", "+faststart", str(out)])
     for t in tmpfiles:
         t.unlink(missing_ok=True)
 
