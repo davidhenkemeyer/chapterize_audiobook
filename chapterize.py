@@ -125,6 +125,22 @@ def duration(path):
     return float(out.decode().strip())
 
 
+_covers = {}
+
+
+def cover_stream(path):
+    """Index of the embedded cover image (an attached_pic video stream), or None."""
+    if path not in _covers:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=index:stream_disposition=attached_pic",
+             "-of", "json", str(path)])
+        pics = [s["index"] for s in json.loads(out)["streams"]
+                if s.get("disposition", {}).get("attached_pic")]
+        _covers[path] = pics[0] if pics else None
+    return _covers[path]
+
+
 def hms(t):
     t = int(t)
     return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}"
@@ -224,6 +240,17 @@ def epub_paragraphs(path):
         p.feed(z.read(n).decode("utf8", "replace"))
         paras.extend(p.paras)
     return paras
+
+
+def epub_title(path):
+    """The book title from the epub's OPF metadata (dc:title), or None."""
+    import html
+    z = zipfile.ZipFile(path)
+    opf = next((n for n in z.namelist() if n.endswith(".opf")), None)
+    if not opf:
+        return None
+    m = re.search(r"<dc:title[^>]*>(.*?)</dc:title>", z.read(opf).decode("utf8", "replace"), re.S)
+    return " ".join(html.unescape(m.group(1)).split()) if m else None
 
 
 HEAD_RE = re.compile(r"^(prolog|proloq|epilog|epiloq|chap)", re.I)
@@ -363,15 +390,16 @@ def cut(parts, a, b, out, meta, tmp):
         tmpfiles.append(t)
 
     if len(tmpfiles) == 1:
-        run(["ffmpeg", "-v", "error", "-y", "-i", str(tmpfiles[0]), 
-             "-i", str(primary_path), "-map_metadata", "1", "-map_chapters", "-1", "-map", "0:a", "-c", "copy",
-             *mdargs, "-movflags", "+faststart", str(out)])
+        src = ["-i", str(tmpfiles[0])]
     else:
         lst = tmp / "list.txt"
         lst.write_text("".join(f"file '{t.as_posix()}'\n" for t in tmpfiles), encoding="utf8")
-        run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-             "-i", str(primary_path), "-map_metadata", "1", "-map_chapters", "-1", "-map", "0:a", "-c", "copy",
-             *mdargs, "-movflags", "+faststart", str(out)])
+        src = ["-f", "concat", "-safe", "0", "-i", str(lst)]
+    cover = cover_stream(primary_path)
+    coverargs = [] if cover is None else ["-map", f"1:{cover}", "-disposition:v:0", "attached_pic"]
+    run(["ffmpeg", "-v", "error", "-y", *src,
+         "-i", str(primary_path), "-map_metadata", "1", "-map_chapters", "-1", "-map", "0:a", *coverargs,
+         "-c", "copy", *mdargs, "-movflags", "+faststart", str(out)])
     for t in tmpfiles:
         t.unlink(missing_ok=True)
 
@@ -382,7 +410,7 @@ def main():
     ap.add_argument("--audio-dir", default=DEFAULT_AUDIO)
     ap.add_argument("--epub", default=DEFAULT_EPUB)
     ap.add_argument("--out", default=DEFAULT_OUT)
-    ap.add_argument("--album", default="Midnight Tides")
+    ap.add_argument("--album", help="album tag for the output files (default: the epub's title)")
     ap.add_argument("--model", default="base.en", help="faster-whisper model (tiny.en, base.en, small.en)")
     ap.add_argument("--scene-gap", type=float, default=2.0, help="min silence (s) that counts as a scene break")
     ap.add_argument("--min-scene", type=float, default=90.0, help="shortest allowed scene (s)")
@@ -421,6 +449,8 @@ def main():
     silences.sort()
 
     print("Reading epub...")
+    album = args.album or epub_title(args.epub) or Path(args.epub).stem
+    print(f"  album: {album}")
     chapters = find_chapters(epub_paragraphs(args.epub))
     print(f"  found {len(chapters)} chapters/sections: "
           + ", ".join(c["title"] for c in chapters[:3]) + " ... " + chapters[-1]["title"])
@@ -466,7 +496,7 @@ def main():
             continue
         print(f"[{i}/{len(plan)}] {folder}/{fname}  ({hms(s)}-{hms(e)})", flush=True)
         cut(parts, s, e, dest,
-            {"title": label, "album": args.album, "track": f"{i}/{len(plan)}"}, work / "tmp")
+            {"title": label, "album": album, "track": f"{i}/{len(plan)}"}, work / "tmp")
     print("Done.")
 
 
