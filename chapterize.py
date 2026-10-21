@@ -38,8 +38,8 @@ from collections import Counter, defaultdict
 from html.parser import HTMLParser
 from pathlib import Path
 
-DEFAULT_AUDIO = r"C:\AudioBooks\Steven Erikson - Malazan Book of the Fallen 05 - Midnight Tides"
-DEFAULT_EPUB = r"C:\Users\david\Malazan 5 - Midnight Tides - Erikson_ Steven.epub"
+DEFAULT_AUDIO = r""
+DEFAULT_EPUB = r""
 DEFAULT_OUT = r"C:\AudioBooks\Chapterized"
 AUDIO_EXTS = {".m4b", ".m4a", ".mp3", ".aac", ".flac", ".ogg", ".opus", ".wav"}
 
@@ -355,20 +355,22 @@ def cut(parts, a, b, out, meta, tmp):
     tmpfiles = []
     for n, (path, s, e, idx) in enumerate(pieces):
         t = tmp / f"piece{n}.m4a"
-        # Using -avoid_negative_ts make_zero ensures timestamps start cleanly at zero for each slice
+        # Using -avoid_negative_ts make_zero ensures timestamps start cleanly at zero for each slice.
+        # -map_chapters -1 everywhere: otherwise the source's chapter track (spanning the whole
+        # original file) is carried over and players report that as the track length.
         run(["ffmpeg", "-v", "error", "-y", "-ss", f"{s:.3f}", "-to", f"{e:.3f}", "-i", str(path),
-             "-map", "0:a:0", "-c", "copy", "-avoid_negative_ts", "make_zero", str(t)])
+             "-map", "0:a:0", "-map_chapters", "-1", "-c", "copy", "-avoid_negative_ts", "make_zero", str(t)])
         tmpfiles.append(t)
 
     if len(tmpfiles) == 1:
         run(["ffmpeg", "-v", "error", "-y", "-i", str(tmpfiles[0]), 
-             "-i", str(primary_path), "-map_metadata", "1", "-map", "0:a", "-c", "copy",
+             "-i", str(primary_path), "-map_metadata", "1", "-map_chapters", "-1", "-map", "0:a", "-c", "copy",
              *mdargs, "-movflags", "+faststart", str(out)])
     else:
         lst = tmp / "list.txt"
         lst.write_text("".join(f"file '{t.as_posix()}'\n" for t in tmpfiles), encoding="utf8")
         run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-             "-i", str(primary_path), "-map_metadata", "1", "-map", "0:a", "-c", "copy",
+             "-i", str(primary_path), "-map_metadata", "1", "-map_chapters", "-1", "-map", "0:a", "-c", "copy",
              *mdargs, "-movflags", "+faststart", str(out)])
     for t in tmpfiles:
         t.unlink(missing_ok=True)
