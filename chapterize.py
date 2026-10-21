@@ -125,6 +125,13 @@ def duration(path):
     return float(out.decode().strip())
 
 
+def format_tag(path, key):
+    out = subprocess.check_output(
+        ["ffprobe", "-v", "error", "-show_entries", f"format_tags={key}",
+         "-of", "default=nw=1:nk=1", str(path)])
+    return out.decode("utf8", "replace").strip() or None
+
+
 _covers = {}
 
 
@@ -450,7 +457,8 @@ def main():
 
     print("Reading epub...")
     album = args.album or epub_title(args.epub) or Path(args.epub).stem
-    print(f"  album: {album}")
+    artist = format_tag(files[0], "album_artist") or format_tag(files[0], "artist")
+    print(f"  album: {album}" + (f"  (artist: {artist})" if artist else ""))
     chapters = find_chapters(epub_paragraphs(args.epub))
     print(f"  found {len(chapters)} chapters/sections: "
           + ", ".join(c["title"] for c in chapters[:3]) + " ... " + chapters[-1]["title"])
@@ -461,27 +469,29 @@ def main():
         c["end"] = chapters[k + 1]["start"] if k + 1 < len(chapters) else total
 
     # Build the plan: front matter, then each chapter split into scenes.
-    plan = []   # (label, folder, filename, start, end)
+    plan = []   # (label, start, end)
     if chapters[0]["start"] > 5:
-        plan.append(("Front matter", "00 Front matter", "00 Front matter.m4a", 0.0, chapters[0]["start"]))
-    for k, c in enumerate(chapters, start=1):
-        folder = f"{k:02d} {c['title']}"
+        plan.append(("Front matter", 0.0, chapters[0]["start"]))
+    for c in chapters:
         cuts = [] if args.no_scenes else plan_scenes(c["start"], c["end"], silences, args.scene_gap, args.min_scene)
         bounds = [c["start"]] + cuts + [c["end"]]
         n = len(bounds) - 1
         for s in range(n):
-            if n == 1:
-                label, fname = c["title"], f"{k:02d} {c['title']}.m4a"
-            else:
-                label = f"{c['title']} - Scene {s + 1:02d}"
-                fname = f"{k:02d}.{s + 1:02d} {label}.m4a"
-            plan.append((label, folder, fname, bounds[s], bounds[s + 1]))
+            label = c["title"] if n == 1 else f"{c['title']} - Scene {s + 1:02d}"
+            plan.append((label, bounds[s], bounds[s + 1]))
+
+    # One flat folder per book, files numbered through the whole book. Plex (and so
+    # Prologue) mis-sorts chapter subfolders and reads names like "02.01" as disc.track.
+    book = out / safe_name(album)
+    width = max(3, len(str(len(plan))))
+    plan = [(label, f"{i:0{width}d} {safe_name(label)}.m4a", s, e)
+            for i, (label, s, e) in enumerate(plan, start=1)]
 
     with open(out / "plan.csv", "w", newline="", encoding="utf8") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "start", "end", "length_min"])
-        for label, folder, fname, s, e in plan:
-            w.writerow([f"{folder}/{fname}", hms(s), hms(e), f"{(e - s) / 60:.1f}"])
+        for label, fname, s, e in plan:
+            w.writerow([f"{book.name}/{fname}", hms(s), hms(e), f"{(e - s) / 60:.1f}"])
     print(f"Plan: {len(plan)} files -> {out / 'plan.csv'}")
     shaky = [c["title"] for c in chapters if c.get("guessed")]
     if shaky:
@@ -490,13 +500,15 @@ def main():
         print("Dry run: nothing cut. Review plan.csv, then run again without --dry-run.")
         return
 
-    for i, (label, folder, fname, s, e) in enumerate(plan, start=1):
-        dest = out / folder / fname
+    for i, (label, fname, s, e) in enumerate(plan, start=1):
+        dest = book / fname
         if dest.exists():
             continue
-        print(f"[{i}/{len(plan)}] {folder}/{fname}  ({hms(s)}-{hms(e)})", flush=True)
-        cut(parts, s, e, dest,
-            {"title": label, "album": album, "track": f"{i}/{len(plan)}"}, work / "tmp")
+        print(f"[{i}/{len(plan)}] {fname}  ({hms(s)}-{hms(e)})", flush=True)
+        meta = {"title": label, "album": album, "track": f"{i}/{len(plan)}", "disc": "1/1"}
+        if artist:
+            meta["album_artist"] = artist
+        cut(parts, s, e, dest, meta, work / "tmp")
     print("Done.")
 
 
