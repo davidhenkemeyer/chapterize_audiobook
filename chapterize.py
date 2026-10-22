@@ -265,18 +265,38 @@ HEAD_RE = re.compile(r"^(prolog|proloq|epilog|epiloq|chap)", re.I)
 
 def find_chapters(paras, min_words=400):
     """Returns [{'kind','num','title','words'(body words)}]; OCR typos tolerated."""
-    heads = [i for i, t in enumerate(paras) if len(t) <= 40 and HEAD_RE.match(t.strip())]
+    # Spaces are dropped before matching so letter-spaced headings ("C H A P T E R") count.
+    heads = [i for i, t in enumerate(paras) if len(t) <= 40 and HEAD_RE.match(re.sub(r"\s", "", t))]
     chapters = []
     for k, i in enumerate(heads):
         end = heads[k + 1] if k + 1 < len(heads) else len(paras)
+        # A heading within two paragraphs of another is a table-of-contents entry. The
+        # word-count check below misses the last TOC entry, whose "body" is whatever
+        # follows the TOC (appendix, author bio...).
+        if (k > 0 and i - heads[k - 1] <= 2) or end - i <= 2:
+            continue
         body = paras[i + 1:end]
         words = " ".join(body).split()
-        if len(words) < min_words:      # table of contents, stray headings, etc.
+        if len(words) < min_words:      # stray headings, etc.
             continue
         h = paras[i].strip().lower()
-        kind = "prologue" if h.startswith(("prolog", "proloq")) else \
-               "epilogue" if h.startswith(("epilog", "epiloq")) else "chapter"
-        chapters.append({"kind": kind, "words": words})
+        hc = re.sub(r"\s", "", h)
+        kind = "prologue" if hc.startswith(("prolog", "proloq")) else \
+               "epilogue" if hc.startswith(("epilog", "epiloq")) else "chapter"
+        # Keep a numeral on prologues/epilogues ("Epilogue II") so the names stay distinct.
+        suffix = h.split()[1:2]
+        suffix = " " + suffix[0].upper() if suffix and re.fullmatch(r"[ivx]+|\d+", suffix[0]) else ""
+        chapters.append({"kind": kind, "words": words, "suffix": suffix, "head": i})
+    # Some scanned epubs have a prologue with no heading: story text straight after the
+    # front matter. Offer the text before the first heading as a possible prologue,
+    # starting at the first real paragraph; align_chapters drops it if the audio disagrees.
+    if chapters and chapters[0]["kind"] != "prologue":
+        pre = paras[:chapters[0]["head"]]
+        first = next((j for j, t in enumerate(pre) if len(t.split()) >= 40), None)
+        if first is not None:
+            words = " ".join(pre[first:]).split()
+            if len(words) >= min_words:
+                chapters.insert(0, {"kind": "prologue", "words": words, "suffix": "", "implied": True})
     n = 0
     for c in chapters:
         if c["kind"] == "chapter":
@@ -285,7 +305,7 @@ def find_chapters(paras, min_words=400):
             c["title"] = f"Chapter {n:02d}"
         else:
             c["num"] = 0
-            c["title"] = c["kind"].capitalize()
+            c["title"] = c["kind"].capitalize() + c["suffix"]
     return chapters
 
 
@@ -319,14 +339,22 @@ def align_chapters(chapters, tw, times):
         index[(nw[i], nw[i + 1], nw[i + 2])].append(i)
     total_epub = sum(len(c["words"]) for c in chapters)
     cum, prev = 0, 0
-    for c in chapters:
+    for c in list(chapters):
         probe = [norm(w) for w in c["words"][:250] if norm(w)]
         frac_idx = int(cum / total_epub * len(nw))
-        lo = prev + 100 if prev else 0
-        pos, v = locate(nw, index, probe, lo, len(nw))
+        lo = min(prev + 100, len(nw) - 1) if prev else 0
+        if c.get("implied"):
+            # An implied prologue must match near the start of the audio, or it isn't one.
+            pos, v = locate(nw, index, probe, 0, len(nw) // 10)
+            if pos is None:
+                chapters.remove(c)
+                continue
+            print(f"  found an unheaded prologue in the epub ({v} votes)")
+        else:
+            pos, v = locate(nw, index, probe, lo, len(nw))
         c["votes"] = v
         if pos is None:
-            pos = max(lo, frac_idx)
+            pos = min(max(lo, frac_idx), len(nw) - 1)
             c["guessed"] = True
             print(f"  WARNING: could not match the start of {c['title']} "
                   f"({v} votes); using a position estimate - check it.")
@@ -460,11 +488,11 @@ def main():
     artist = format_tag(files[0], "album_artist") or format_tag(files[0], "artist")
     print(f"  album: {album}" + (f"  (artist: {artist})" if artist else ""))
     chapters = find_chapters(epub_paragraphs(args.epub))
-    print(f"  found {len(chapters)} chapters/sections: "
-          + ", ".join(c["title"] for c in chapters[:3]) + " ... " + chapters[-1]["title"])
 
     print("Aligning chapters to audio...")
     align_chapters(chapters, tw, times)
+    print(f"  {len(chapters)} chapters/sections: "
+          + ", ".join(c["title"] for c in chapters[:3]) + " ... " + chapters[-1]["title"])
     for k, c in enumerate(chapters):
         c["end"] = chapters[k + 1]["start"] if k + 1 < len(chapters) else total
 
