@@ -56,11 +56,12 @@ echo ===========================================================================
 echo Book %NUM%: %TITLE%
 echo ===========================================================================
 if not exist "%AUDIO%\" (
-    echo   SKIPPED: audio folder not found: %AUDIO%
+    echo   SKIPPED: audio folder not found: "%AUDIO%"
     exit /b 0
 )
 if not exist "%EPUB%" (
-    echo   SKIPPED: epub not found: %EPUB%
+    rem Quoted: a ")" in the name would end this block.
+    echo   SKIPPED: epub not found: "%EPUB%"
     exit /b 0
 )
 python chapterize.py --audio-dir "%AUDIO%" --epub "%EPUB%" --album "%ALBUM%" --dry-run --out "%OUT%"
