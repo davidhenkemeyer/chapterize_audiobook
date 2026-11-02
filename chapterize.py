@@ -8,13 +8,14 @@ How it works
      matches the first words of each chapter against the transcript to find
      where each chapter starts in the audio. Works across multiple audio files
      (a chapter that spans two parts is stitched together automatically).
-  3. Finds scene breaks inside each chapter from long silences (the epub has
-     no scene markers, so this is pause-based).
+  3. Finds scene breaks inside each chapter: the epub's own ("* * *") when it
+     marks them all, otherwise the narrator's long pauses (plus any breaks the
+     epub does mark). Many OCR'd epubs have lost their scene markers.
   4. Joins all the audio files into one .m4b with ffmpeg stream-copy (no
      re-encoding, no quality loss), with a chapter marker for every scene.
 
 Requirements
-  - Python 3.9+
+  - Python 3.10+
   - ffmpeg/ffprobe, numpy and faster-whisper are installed automatically on first
     run if missing (ffmpeg via `winget install Gyan.FFmpeg`, packages via pip).
 
@@ -22,8 +23,9 @@ Usage (defaults match the Midnight Tides paths):
   python chapterize.py --dry-run     # transcribe + write plan.csv, don't build
   python chapterize.py               # do everything
 
-Tune scene detection with --scene-gap (seconds of silence that count as a scene
-break, default 2.0) and --min-scene (shortest allowed scene, default 90 s).
+Tune pause-based scene detection with --scene-gap (seconds of silence that count
+as a scene break; by default picked per book, since some narrators pause 2 s at
+every other paragraph) and --min-scene (shortest allowed scene, default 90 s).
 Re-running is cheap: transcripts and silences are cached in <out>/_work.
 """
 import argparse
@@ -235,18 +237,21 @@ def detect_silences(path, cache, noise="-35dB", min_dur=0.5):
 class _P(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.paras, self.buf, self.depth = [], [], 0
+        self.paras, self.classes, self.buf, self.depth, self.cls = [], [], [], 0, ""
 
     def handle_starttag(self, tag, attrs):
         if tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6"):
             self.depth += 1
+            if self.depth == 1:
+                self.cls = f"{tag}." + (dict(attrs).get("class") or "")
 
     def handle_endtag(self, tag):
         if tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6") and self.depth:
             self.depth -= 1
             t = " ".join("".join(self.buf).split())
-            if t:
+            if t or tag == "p":        # empty ones may be spacers (see _styled_breaks)
                 self.paras.append(t)
+                self.classes.append(self.cls)
             self.buf = []
 
     def handle_data(self, d):
@@ -269,14 +274,63 @@ def epub_paragraphs(path):
                 order.append(base + manifest[idref])
     if not order:
         order = sorted(n for n in names if re.search(r"\.(x?html?)$", n))
-    paras = []
+    paras, classes = [], []
     for n in order:
         if n not in names:
             continue
         p = _P()
         p.feed(z.read(n).decode("utf8", "replace"))
         paras.extend(p.paras)
-    return paras
+        classes.extend(p.classes)
+    css = "".join(z.read(n).decode("utf8", "replace") for n in names if n.endswith(".css"))
+    return _styled_breaks(paras, classes, css)
+
+
+def _css_em(v):
+    m = re.match(r"(-?[\d.]+)(em|rem|px|pt)?", v.strip())
+    if not m:
+        return 0.0
+    return float(m.group(1)) / {"px": 16, "pt": 12}.get(m.group(2), 1)
+
+
+def _styled_breaks(paras, classes, css):
+    """Retail epubs mark a scene break with spacing, not "* * *", in one of two ways:
+      - an empty spacer paragraph (<p class="spaceBreak"> </p>), in a class used for
+        little else - OCR'd epubs leave empty paragraphs at page breaks too, but in
+        the same class as the text;
+      - the scene's first paragraph is unindented, with a blank line's worth of margin
+        above. Only once the story has begun under the current heading: a chapter's
+        epigraph and dateline use the same style.
+    Turns both into "* * *" paragraphs, and drops other empty paragraphs."""
+    style = {}
+    for names, body in re.findall(r"([^{}]+)\{([^}]*)\}", css):
+        decl = dict((k.strip().lower(), v.strip()) for k, _, v in
+                    (d.partition(":") for d in body.split(";")) if v)
+        top = decl.get("margin-top") or (decl.get("margin") or "0").split()[0]
+        for name in re.findall(r"\.([\w-]+)", names):
+            style[name] = (_css_em(decl.get("text-indent", "0")), _css_em(top))
+    empty = Counter(c for t, c in zip(paras, classes) if not t)
+    used = Counter(classes)
+    spacers = {c for c, n in empty.items() if n >= 10 and n >= 0.9 * used[c]}
+    normal = Counter(c for t, c in zip(paras, classes) if t and c.startswith("p.")).most_common(1)
+    normal = normal[0][0] if normal else None
+    starts = set()
+    if normal and max((style.get(n, (0, 0))[0] for n in normal[2:].split()), default=0) > 0:
+        starts = {c for c in set(classes) if c.startswith("p.") and c != normal
+                  and any(style.get(n, (1, 0))[0] == 0 and style[n][1] >= 1.0 for n in c[2:].split())}
+    out, story = [], False
+    for t, c in zip(paras, classes):
+        if not t:
+            if c in spacers:
+                out.append("* * *")
+            continue
+        if not c.startswith("p."):
+            story = False
+        elif c in starts and story:
+            out.append("* * *")
+        story = story or c == normal
+        out.append(t)
+    return out
 
 
 def epub_title(path):
@@ -335,6 +389,19 @@ def join_drop_caps(paras):
     return out
 
 
+def _after_attribution(body, k, between=3):
+    """body[k] comes after an epigraph's attribution, perhaps with a few short title or
+    dateline lines between ("I" / "Maeth'ki Im..." / "298,665 years before Burn's Sleep.").
+    The attribution must look like a source, or real prose must follow within a few
+    paragraphs - otherwise it's likely dialogue inside a poem."""
+    for j in range(k - 1, max(0, k - 1 - between) - 1, -1):
+        if _attribution(body[j]) and (_source_line(body[j]) or any(len(t.split()) >= 30 for t in body[k:k + 5])):
+            return True
+        if len(body[j].split()) > 12:
+            return False
+    return False
+
+
 def epigraph_len(body, max_words=450, scan=45):
     """Number of leading paragraphs of a chapter body that are its epigraph (0 if none).
     The story starts at the first small-caps paragraph, or failing that at the first
@@ -343,14 +410,35 @@ def epigraph_len(body, max_words=450, scan=45):
     n = min(len(body), scan)
     k = next((k for k in range(n) if _caps_start(body[k])), None)
     if k is None:
-        # The line before must look like a source, or real prose must follow within a few
-        # paragraphs - otherwise it's likely dialogue inside a poem.
-        k = next((k for k in range(1, n) if _attribution(body[k - 1]) and _story_para(body[k])
-                  and (_source_line(body[k - 1]) or any(len(t.split()) >= 30 for t in body[k:k + 5]))),
-                 None)
+        k = next((k for k in range(1, n) if _story_para(body[k]) and _after_attribution(body, k)), None)
     if k is None or k < 2 or sum(len(t.split()) for t in body[:k]) > max_words:
         return 0
     return k
+
+
+PART_RE = re.compile(r"\s*(?i:book)\s*(?:(?i:one|two|three|four|five|six|seven|eight|nine|ten)|\d+|[IVX]+)(?![a-z])")
+SCENE_SEP = re.compile(r"^[\s*■•◆~#]*[*■•◆~#][\s*■•◆~#]*$|^_{3,}$")     # "* * *", "■", "_____"
+
+
+def scene_breaks(body, story_start=0, min_story=40):
+    """Scene breaks the epub marks ("* * *"): [(word offset of the next paragraph within the
+    body, separators not counted; its opening words)]. Separators before the story has
+    run min_story words (around an epigraph, its attribution, a dateline) don't count.
+    Most OCR'd epubs lost these; some kept all of them."""
+    sep = [bool(SCENE_SEP.match(t)) for t in body] + [False]
+
+    def verse(j):       # a line of a poem with a gap after every line
+        return 0 <= j < len(body) and not sep[j] and len(body[j].split()) <= 8
+
+    out, n = [], 0
+    for k, t in enumerate(body):
+        if not sep[k]:
+            n += len(t.split())
+        elif (n >= story_start + min_story and k < len(body) - 1 and not sep[k + 1]
+              and not (verse(k + 1) and sep[k + 2]) and not (verse(k - 1) and k >= 2 and sep[k - 2])):
+            nxt = [p for p in body[k + 1:k + 8] if not SCENE_SEP.match(p)]
+            out.append((n, " ".join(nxt).split()[:250]))
+    return out
 
 
 def find_chapters(paras, min_words=400):
@@ -365,7 +453,13 @@ def find_chapters(paras, min_words=400):
         # follows the TOC (appendix, author bio...).
         if (k > 0 and i - heads[k - 1] <= 2) or end - i <= 2:
             continue
-        body = paras[i + 1:end]
+        marked = paras[i + 1:end]
+        # A part page ("Book One / Pale" and its extract) ends the chapter before it: no
+        # scene breaks in it, and it isn't part of the chapter's text.
+        part = next((j for j, t in enumerate(marked) if len(t) <= 60 and PART_RE.match(t)), None)
+        if part is not None and part > 0:
+            marked = marked[:part]
+        body = [t for t in marked if not SCENE_SEP.match(t)]
         words = " ".join(body).split()
         if len(words) < min_words:      # stray headings, etc.
             continue
@@ -382,6 +476,7 @@ def find_chapters(paras, min_words=400):
         if epi:
             c["epigraph_words"] = len(" ".join(body[:epi]).split())
             c["story_words"] = " ".join(body[epi:]).split()
+        c["breaks"] = scene_breaks(marked, c.get("epigraph_words", 0))
         chapters.append(c)
     # Some scanned epubs have a prologue with no heading: story text straight after the
     # front matter. Offer the text before the first heading as a possible prologue,
@@ -709,6 +804,15 @@ def align_chapters(chapters, tw, times):
                 spos = _snap(nw, tw, sprobe, spos, pos + 1)
                 if spos > pos:
                     c["story_time"], c["story_prev_time"] = times[spos], times[spos - 1]
+        # The epub's own scene breaks: match the words after each one near where its word
+        # offset puts it (the transcript's word count drifts a little from the epub's).
+        c["marked"] = []
+        for off, words in ([] if c.get("guessed") else c.get("breaks", ())):
+            bprobe = [norm(w) for w in words if norm(w)]
+            reach = 300 + off // 10
+            bpos, _ = locate(nw, index, bprobe, max(pos + 1, pos + off - reach), min(len(nw), pos + off + reach))
+            if bpos is not None:
+                c["marked"].append(_snap(nw, tw, bprobe, bpos, pos + 1))
         prev = pos
         cum += len(c["words"])
 
@@ -720,17 +824,50 @@ def story_boundary(c, silences, min_len=3.0):
     t = c.get("story_time")
     if t is None:
         return None
-    # Only a pause between the epigraph's last word and the story's first: the narrator
-    # also pauses between the quote and its attribution.
-    pauses = [(s, e) for s, e in silences if c["story_prev_time"] < e <= t + 0.5]
-    if pauses:
-        s, e = max(pauses, key=lambda p: p[1])
-        t = max(s, e - 0.5)
+    t = break_before(t, c["story_prev_time"], silences)
     return t if c["start"] + min_len <= t < c["end"] else None
 
 
-def plan_scenes(a, b, silences, gap, min_scene, guard=8.0):
-    """Return scene boundaries (list of times) inside [a, b)."""
+def break_before(t, prev_t, silences):
+    """Move a section start (its first word at t) back into the pause before it. Only a
+    pause after the previous word (starting at prev_t) counts: the narrator also pauses
+    mid-sentence, e.g. between an epigraph's quote and its attribution. Whisper often puts
+    the word's start well inside the pause, so the pause may end after t."""
+    i = bisect.bisect_left(silences, prev_t, key=lambda p: p[0])
+    pauses = [(s, e) for s, e in silences[i:i + 50] if s <= t + 0.3]
+    if pauses:
+        s, e = max(pauses, key=lambda p: p[1])
+        t = max(s, e - 0.5)
+    return t
+
+
+def marked_break(k, times, silences, reach=3, min_pause=1.0):
+    """Time of an epub-marked scene break whose next paragraph starts at transcript word k.
+    The narrator pauses there; if the match is a word or two off, use the longest pause
+    before a nearby word instead."""
+    best, bd = k, 0.0
+    for j in range(max(1, k - reach), min(len(times), k + reach + 1)):
+        i = bisect.bisect_left(silences, times[j - 1], key=lambda p: p[0])
+        d = max((e - s for s, e in silences[i:i + 5] if s <= times[j] + 0.3), default=0.0)
+        if d > bd + 0.2 or (abs(d - bd) <= 0.2 and abs(j - k) < abs(best - k)):
+            best, bd = j, d
+    if bd < min_pause:
+        best = k
+    return break_before(times[best], times[best - 1], silences)
+
+
+def auto_scene_gap(silences, total, per_hour=12.0, lo=2.0, hi=3.5):
+    """Narrators differ: some pause 2 s and more only between scenes, others at every
+    other paragraph. Take the shortest gap that at most `per_hour` pauses an hour reach
+    (scenes run 7-10 an hour in the books whose epubs mark them all)."""
+    lens = sorted((e - s for s, e in silences), reverse=True)
+    k = int(per_hour * total / 3600)
+    return min(hi, max(lo, round(lens[k] + 0.05, 1))) if k < len(lens) else lo
+
+
+def plan_scenes(a, b, silences, gap, min_scene, guard=8.0, fixed=()):
+    """Return scene boundaries (list of times) inside [a, b): the `fixed` ones (marked in
+    the epub) plus the longest pauses that leave every scene at least min_scene long."""
     starts = [s for s, _ in silences]
     cands = []
     i = bisect.bisect_left(starts, a + guard)
@@ -739,7 +876,7 @@ def plan_scenes(a, b, silences, gap, min_scene, guard=8.0):
         if e - s >= gap:
             cands.append((e - s, max(s, e - 0.5)))
         i += 1
-    accepted = []
+    accepted = [t for t in fixed if a + guard <= t < b - guard]
     for d, t in sorted(cands, reverse=True):
         pts = sorted(accepted + [a, b])
         j = bisect.bisect_left(pts, t)
@@ -813,7 +950,8 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--album", help="album/title tag for the output (default: the epub's title)")
     ap.add_argument("--model", default="base.en", help="faster-whisper model (tiny.en, base.en, small.en)")
-    ap.add_argument("--scene-gap", type=float, default=2.0, help="min silence (s) that counts as a scene break")
+    ap.add_argument("--scene-gap", type=float, help="min silence (s) that counts as a scene break "
+                    "(default: picked per book from how often the narrator pauses)")
     ap.add_argument("--min-scene", type=float, default=90.0, help="shortest allowed scene (s)")
     ap.add_argument("--noise", default="-35dB", help="silence threshold; raise (e.g. -30dB) if too few pauses found")
     ap.add_argument("--no-scenes", action="store_true", help="one marker per chapter, not per scene")
@@ -874,6 +1012,29 @@ def main():
     for k, c in enumerate(chapters):
         c["end"] = chapters[k + 1]["start"] if k + 1 < len(chapters) else (back or total)
 
+    # Scene breaks: the epub's own where it marks them all; otherwise long pauses, plus
+    # whichever breaks the epub still marks.
+    for c in chapters:
+        # A "scene" under 20 s is a stylistic gap: spaced-out fragments, a poem with a gap
+        # between every line, a closing line. Of a run of such gaps keep only the first.
+        kept, last = [], c["start"]
+        for t in sorted(marked_break(k, times, silences) for k in c.get("marked", ())):
+            r = remap(t, removed)     # lengths as heard, publisher credits cut
+            if r - remap(last, removed) >= 20 and remap(c["end"], removed) - r >= 20:
+                kept.append(t)
+            last = t
+        c["marked"] = kept
+    n_marked = sum(len(c["marked"]) for c in chapters)
+    marks_only = n_marked >= 4 * total / 3600
+    gap = args.scene_gap or auto_scene_gap(silences, total)
+    if args.no_scenes:
+        pass
+    elif marks_only:
+        print(f"  scenes: the {n_marked} scene breaks marked in the epub")
+    else:
+        print(f"  scenes: pauses of {gap:.1f} s or more"
+              + (f", plus {n_marked} scene breaks marked in the epub" if n_marked else ""))
+
     # Build the plan: front matter, each chapter split into scenes, back matter.
     plan = []   # (label, start, end)
     if chapters[0]["start"] > 5:
@@ -884,7 +1045,9 @@ def main():
         if story:
             plan.append((f"{c['title']} - Epigraph", begin, story))
             begin = story
-        cuts = [] if args.no_scenes else plan_scenes(begin, c["end"], silences, args.scene_gap, args.min_scene)
+        cuts = [] if args.no_scenes else \
+            [t for t in c["marked"] if begin + 10 <= t < c["end"] - 10] if marks_only else \
+            plan_scenes(begin, c["end"], silences, gap, args.min_scene, fixed=c["marked"])
         bounds = [begin] + cuts + [c["end"]]
         n = len(bounds) - 1
         for s in range(n):

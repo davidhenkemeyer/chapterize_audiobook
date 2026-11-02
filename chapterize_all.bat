@@ -22,17 +22,20 @@ rem   Audio folder:  <AUDIO_ROOT>\Steven Erikson - Malazan Book of the Fallen <n
 rem   Output folder: <AUDIO_ROOT>\Malazan <num without leading 0> - <book title, apostrophes removed>
 rem                  (transcripts are cached in its _work folder)
 rem   Album/title:   Malazan <num without leading 0> - <book title>  (also the .m4b filename)
+rem
+rem Scene markers come from the epub's scene breaks. The "(omnibus)" epubs are the
+rem retail omnibus split into books with: python split_omnibus.py <omnibus.epub> d:\tmp
 
-call :book 01 "Gardens of the Moon"   "Gardens of the Moon"  "Malazan 1 - Gardens of the Moon - Steven Erickson.epub"
-call :book 02 "Deadhouse Gates"       "Deadhouse Gates"      "Malazan 2 - DeadHouse Gates - Steven Erickson.epub"
-call :book 03 "Memories of Ice"       "Memories of Ice"      "Malazan 3 - Memories of Ice - Steven Erickson.epub"
-call :book 04 "House of Chains"       "House of Chains"      "Malazan  4 - House of Chains - Steven Erickson.epub"
-call :book 05 "Midnight Tides"        "Midnight Tides"       "Malazan 5 - Midnight Tides - Erikson_ Steven.epub"
-call :book 06 "Bonehunters"           "The Bonehunters"      "Malazan 6 - The Bonehunters - Steven Erikson.epub"
-call :book 07 "Reaper's Gale"         "Reaper's Gale"        "Malazan 7 - Reaper's Gale - Steven Erickson.epub"
-call :book 08 "Toll the Hounds"       "Toll the Hounds"      "Malazan 08 - Toll the Hounds - Steven Erikson.epub"
-call :book 09 "Dust of Dreams"        "Dust of Dreams"       "Malazan 9 - Dust of Dreams - Steven Erikson.epub"
-call :book 10 "The Crippled God"      "The Crippled God"     "Malazan 10 - The Crippled God - Erikson_ Steven.epub"
+call :book 01 "Gardens of the Moon"   "Gardens of the Moon"  "Malazan 1 - Gardens of the Moon - Steven Erikson (omnibus).epub"
+call :book 02 "Deadhouse Gates"       "Deadhouse Gates"      "Malazan 2 - Deadhouse Gates - Steven Erikson (omnibus).epub"
+call :book 03 "Memories of Ice"       "Memories of Ice"      "Malazan 3 - Memories of Ice - Steven Erikson (omnibus).epub"
+call :book 04 "House of Chains"       "House of Chains"      "Malazan 4 - House of Chains - Steven Erikson (omnibus).epub"
+call :book 05 "Midnight Tides"        "Midnight Tides"       "Malazan 5 - Midnight Tides - Steven Erikson (omnibus).epub"
+call :book 06 "Bonehunters"           "The Bonehunters"      "Malazan 6 - The Bonehunters - Steven Erikson (omnibus).epub"
+call :book 07 "Reaper's Gale"         "Reaper's Gale"        "Malazan 7 - Reaper's Gale - Steven Erikson (omnibus).epub"
+call :book 08 "Toll the Hounds"       "Toll the Hounds"      "Malazan 8 - Toll the Hounds - Steven Erikson (omnibus).epub"
+call :book 09 "Dust of Dreams"        "Dust of Dreams"       "Malazan 9 - Dust of Dreams - Steven Erikson (omnibus).epub"
+call :book 10 "The Crippled God"      "The Crippled God"     "Malazan 10 - The Crippled God - Steven Erikson (omnibus).epub"
 
 echo.
 echo All done.
