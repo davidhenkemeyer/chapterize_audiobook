@@ -922,6 +922,14 @@ def build_m4b(parts, plan, out, meta, tmp, cuts=()):
         f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={round(s * 1000)}\nEND={round(e * 1000)}\ntitle={_ffmeta(label)}\n"
         for label, s, e in plan), encoding="utf8")
 
+    # Join the audio on its own first. A cut at the very start leaves the audio starting
+    # at the inpoint, which the muxer writes as an empty edit: Plex/Prologue honour it and
+    # play everything that much later than the chapter markers, foobar2000 doesn't.
+    # make_zero removes it, but only when no other stream (the cover) already starts at 0.
+    joined = tmp / "joined.m4a"
+    run(["ffmpeg", "-v", "error", "-stats", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+         "-map", "0:a:0", "-c", "copy", "-avoid_negative_ts", "make_zero", "-f", "ipod", str(joined)])
+
     mdargs = []
     for k, v in meta.items():
         mdargs += ["-metadata", f"{k}={v}"]
@@ -932,12 +940,18 @@ def build_m4b(parts, plan, out, meta, tmp, cuts=()):
     cover = extract_cover(primary, tmp)
     coverargs = [] if cover is None else ["-i", str(cover), "-map", "3", "-disposition:v:0", "attached_pic"]
     partial = out.with_suffix(".partial.m4b")
-    run(["ffmpeg", "-v", "error", "-stats", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+    run(["ffmpeg", "-v", "error", "-stats", "-y", "-i", str(joined),
          "-i", str(chap), "-i", str(primary), *coverargs[:2],
          "-map", "0:a:0", *coverargs[2:], "-map_metadata", "2", "-map_chapters", "1",
          "-c", "copy", *mdargs, "-movflags", "+faststart", "-f", "ipod", str(partial)])
+    start = float(subprocess.check_output(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=start_time",
+         "-of", "default=nw=1:nk=1", str(partial)]).decode().strip())
+    if abs(start) > 0.01:
+        sys.exit(f"{partial.name}: the audio starts at {start:.3f} s instead of 0, so players "
+                 f"would disagree on where the chapters are.")
     partial.replace(out)
-    for f in (lst, chap, cover):
+    for f in (lst, chap, cover, joined):
         if f:
             f.unlink(missing_ok=True)
 
